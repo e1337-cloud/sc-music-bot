@@ -82,8 +82,8 @@ async def cmd_help(message: Message):
 async def inline_search(inline_query: InlineQuery):
     query = inline_query.query.strip()
 
-    # Если запрос пустой или слишком короткий, показываем подсказку
-    if len(query) < 2:
+    # Если запрос пустой, показываем подсказку
+    if not query:
         placeholder = InlineQueryResultArticle(
             id="hint",
             title="🔍 Введи название трека или исполнителя",
@@ -93,7 +93,7 @@ async def inline_search(inline_query: InlineQuery):
                 parse_mode="HTML"
             )
         )
-        await inline_query.answer([placeholder], cache_time=10, is_personal=True)
+        await inline_query.answer([placeholder], cache_time=5, is_personal=True)
         return
 
     try:
