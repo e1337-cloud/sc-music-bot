@@ -17,9 +17,27 @@ class SoundCloudAPI:
     }
     _client_id: Optional[str] = None
     _lock = asyncio.Lock()
+    _session: Optional[aiohttp.ClientSession] = None
 
     def __init__(self):
         pass
+
+    async def get_session(self) -> aiohttp.ClientSession:
+        """Получение или создание переиспользуемой сессии aiohttp с connection pooling."""
+        if self._session is None or self._session.closed:
+            connector = aiohttp.TCPConnector(ssl=False, limit=20, ttl_dns_cache=300)
+            timeout = aiohttp.ClientTimeout(total=15, connect=5)
+            self._session = aiohttp.ClientSession(
+                headers=self.HEADERS,
+                connector=connector,
+                timeout=timeout
+            )
+        return self._session
+
+    async def close(self):
+        """Закрытие HTTP-сессии при завершении работы."""
+        if self._session and not self._session.closed:
+            await self._session.close()
 
     async def get_client_id(self, force_refresh: bool = False) -> str:
         """Динамическое извлечение и кэширование актуального client_id из JS бандлов SoundCloud."""
@@ -28,30 +46,29 @@ class SoundCloudAPI:
                 return self._client_id
 
             logger.info("Поиск актуального SoundCloud client_id...")
-            connector = aiohttp.TCPConnector(ssl=False)
-            async with aiohttp.ClientSession(headers=self.HEADERS, connector=connector) as session:
-                try:
-                    async with session.get("https://soundcloud.com", timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                        if resp.status == 200:
-                            html = await resp.text()
-                            scripts = re.findall(r'<script[^>]+src="([^"]+)"', html)
-                            cdn_scripts = [s for s in scripts if "sndcdn.com/assets" in s]
+            session = await self.get_session()
+            try:
+                async with session.get("https://soundcloud.com", timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        html = await resp.text()
+                        scripts = re.findall(r'<script[^>]+src="([^"]+)"', html)
+                        cdn_scripts = [s for s in scripts if "sndcdn.com/assets" in s]
 
-                            for s_url in reversed(cdn_scripts):
-                                try:
-                                    async with session.get(s_url, timeout=aiohttp.ClientTimeout(total=8)) as s_resp:
-                                        if s_resp.status == 200:
-                                            js = await s_resp.text()
-                                            matches = re.findall(r'client_id[:=]\s*"([0-9a-zA-Z]{32})"', js)
-                                            if matches:
-                                                self._client_id = matches[0]
-                                                logger.info(f"Успешно найден client_id: {self._client_id}")
-                                                return self._client_id
-                                except Exception as e:
-                                    logger.debug(f"Ошибка проверки скрипта {s_url}: {e}")
-                                    continue
-                except Exception as e:
-                    logger.warning(f"Ошибка при получении HTML soundcloud.com: {e}")
+                        for s_url in reversed(cdn_scripts):
+                            try:
+                                async with session.get(s_url, timeout=aiohttp.ClientTimeout(total=8)) as s_resp:
+                                    if s_resp.status == 200:
+                                        js = await s_resp.text()
+                                        matches = re.findall(r'client_id[:=]\s*"([0-9a-zA-Z]{32})"', js)
+                                        if matches:
+                                            self._client_id = matches[0]
+                                            logger.info(f"Успешно найден client_id: {self._client_id}")
+                                            return self._client_id
+                            except Exception as e:
+                                logger.debug(f"Ошибка проверки скрипта {s_url}: {e}")
+                                continue
+            except Exception as e:
+                logger.warning(f"Ошибка при получении HTML soundcloud.com: {e}")
 
             if not self._client_id:
                 # Резервный проверенный публичный client_id
@@ -69,12 +86,11 @@ class SoundCloudAPI:
 
         duration_sec = int((item.get("duration") or 0) / 1000)
         user = item.get("user") or {}
-        artist = user.get("username", "Unknown Artist")
-        title = item.get("title", "Untitled")
+        artist = (user.get("username") or "Unknown Artist").strip()
+        title = (item.get("title") or "Untitled").strip()
 
         # Проверяем, не является ли трек платным Go+ превью
         is_snipped = item.get("snipped", False) or item.get("policy") == "SNIP"
-        # Проверяем наличие медиа потоков
         media = item.get("media", {})
         transcodings = media.get("transcodings", [])
         has_full_stream = False
@@ -100,25 +116,24 @@ class SoundCloudAPI:
     async def get_track_by_id(self, track_id: str) -> Optional[Dict[str, Any]]:
         """Получение метаданных трека по его ID."""
         client_id = await self.get_client_id()
+        session = await self.get_session()
 
         for attempt in range(2):
             try:
-                connector = aiohttp.TCPConnector(ssl=False)
-                async with aiohttp.ClientSession(headers=self.HEADERS, connector=connector) as session:
-                    params = {"client_id": client_id}
-                    async with session.get(
-                        f"{self.BASE_URL}/tracks/{track_id}",
-                        params=params,
-                        timeout=aiohttp.ClientTimeout(total=10)
-                    ) as resp:
-                        if resp.status in (401, 403):
-                            client_id = await self.get_client_id(force_refresh=True)
-                            continue
-                        if resp.status == 404:
-                            return None
-                        if resp.status == 200:
-                            data = await resp.json()
-                            return self._format_track(data)
+                params = {"client_id": client_id}
+                async with session.get(
+                    f"{self.BASE_URL}/tracks/{track_id}",
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    if resp.status in (401, 403):
+                        client_id = await self.get_client_id(force_refresh=True)
+                        continue
+                    if resp.status == 404:
+                        return None
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return self._format_track(data)
             except Exception as e:
                 logger.error(f"Ошибка при получении трека {track_id}: {e}")
                 if attempt == 0:
@@ -133,34 +148,33 @@ class SoundCloudAPI:
             return []
 
         client_id = await self.get_client_id()
+        session = await self.get_session()
 
         for attempt in range(2):
             try:
-                connector = aiohttp.TCPConnector(ssl=False)
-                async with aiohttp.ClientSession(headers=self.HEADERS, connector=connector) as session:
-                    params = {
-                        "q": query,
-                        "client_id": client_id,
-                        "limit": limit,
-                        "offset": 0
-                    }
-                    async with session.get(
-                        f"{self.BASE_URL}/search/tracks",
-                        params=params,
-                        timeout=aiohttp.ClientTimeout(total=8)
-                    ) as resp:
-                        if resp.status in (401, 403):
-                            logger.warning(f"SoundCloud API {resp.status}, обновляем client_id...")
-                            client_id = await self.get_client_id(force_refresh=True)
-                            continue
+                params = {
+                    "q": query,
+                    "client_id": client_id,
+                    "limit": limit,
+                    "offset": 0
+                }
+                async with session.get(
+                    f"{self.BASE_URL}/search/tracks",
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=8)
+                ) as resp:
+                    if resp.status in (401, 403):
+                        logger.warning(f"SoundCloud API {resp.status}, обновляем client_id...")
+                        client_id = await self.get_client_id(force_refresh=True)
+                        continue
 
-                        if resp.status == 200:
-                            data = await resp.json()
-                            results = []
-                            for item in data.get("collection", []):
-                                if item.get("kind") == "track":
-                                    results.append(self._format_track(item))
-                            return results
+                    if resp.status == 200:
+                        data = await resp.json()
+                        results = []
+                        for item in data.get("collection", []):
+                            if item.get("kind") == "track":
+                                results.append(self._format_track(item))
+                        return results
             except Exception as e:
                 logger.error(f"Ошибка при поиске '{query}' (попытка {attempt+1}): {e}")
                 if attempt == 0:
@@ -169,39 +183,48 @@ class SoundCloudAPI:
         return []
 
     async def resolve_url(self, url: str) -> Optional[Dict[str, Any]]:
-        """Получение метаданных по ссылке на трек."""
+        """Получение метаданных по ссылке на трек (с поддержкой коротких on.soundcloud.com ссылок)."""
+        session = await self.get_session()
+
+        # Если это короткая ссылка on.soundcloud.com, сначала получаем реальный URL через редирект
+        if "on.soundcloud.com" in url:
+            try:
+                async with session.get(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=8)) as redir_resp:
+                    url = str(redir_resp.url).split("?")[0]
+                    logger.info(f"Короткая ссылка on.soundcloud.com развернута в: {url}")
+            except Exception as e:
+                logger.warning(f"Не удалось развернуть короткую ссылку {url}: {e}")
+
         client_id = await self.get_client_id()
 
         for attempt in range(2):
             try:
-                connector = aiohttp.TCPConnector(ssl=False)
-                async with aiohttp.ClientSession(headers=self.HEADERS, connector=connector) as session:
-                    params = {
-                        "url": url,
-                        "client_id": client_id
-                    }
-                    async with session.get(
-                        f"{self.BASE_URL}/resolve",
-                        params=params,
-                        timeout=aiohttp.ClientTimeout(total=10)
-                    ) as resp:
-                        if resp.status in (401, 403):
-                            client_id = await self.get_client_id(force_refresh=True)
-                            continue
-                        if resp.status == 404:
-                            return None
-                        if resp.status == 200:
-                            data = await resp.json()
-                            if data.get("kind") == "track":
-                                return self._format_track(data)
-                            elif data.get("kind") == "playlist":
-                                tracks = [self._format_track(t) for t in data.get("tracks", []) if t.get("kind") == "track"]
-                                return {
-                                    "kind": "playlist",
-                                    "id": str(data.get("id")),
-                                    "title": data.get("title", "SoundCloud Playlist"),
-                                    "tracks": tracks
-                                }
+                params = {
+                    "url": url,
+                    "client_id": client_id
+                }
+                async with session.get(
+                    f"{self.BASE_URL}/resolve",
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    if resp.status in (401, 403):
+                        client_id = await self.get_client_id(force_refresh=True)
+                        continue
+                    if resp.status == 404:
+                        return None
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("kind") == "track":
+                            return self._format_track(data)
+                        elif data.get("kind") == "playlist":
+                            tracks = [self._format_track(t) for t in data.get("tracks", []) if t.get("kind") == "track"]
+                            return {
+                                "kind": "playlist",
+                                "id": str(data.get("id")),
+                                "title": data.get("title", "SoundCloud Playlist"),
+                                "tracks": tracks
+                            }
             except Exception as e:
                 logger.error(f"Ошибка при резолве URL {url}: {e}")
                 if attempt == 0:

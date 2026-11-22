@@ -8,8 +8,8 @@ async def init_db():
         await db.execute("""
             CREATE TABLE IF NOT EXISTS tracks_cache (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                track_id TEXT UNIQUE,
-                permalink_url TEXT UNIQUE,
+                track_id TEXT UNIQUE NOT NULL,
+                permalink_url TEXT NOT NULL,
                 telegram_file_id TEXT NOT NULL,
                 title TEXT,
                 artist TEXT,
@@ -17,14 +17,20 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Индекс для быстрого поиска по permalink_url
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tracks_permalink ON tracks_cache (permalink_url)
+        """)
         await db.commit()
 
 async def get_cached_track_by_id(track_id: str) -> Optional[Dict[str, Any]]:
     """Получить закэшированный трек по track_id."""
+    if not track_id:
+        return None
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM tracks_cache WHERE track_id = ?",
+            "SELECT * FROM tracks_cache WHERE track_id = ? LIMIT 1",
             (str(track_id),)
         ) as cursor:
             row = await cursor.fetchone()
@@ -34,13 +40,15 @@ async def get_cached_track_by_id(track_id: str) -> Optional[Dict[str, Any]]:
 
 async def get_cached_track_by_url(permalink_url: str) -> Optional[Dict[str, Any]]:
     """Получить закэшированный трек по permalink_url."""
+    if not permalink_url:
+        return None
     # Нормализуем URL (убираем query параметры, если есть)
     clean_url = permalink_url.split("?")[0].rstrip("/")
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM tracks_cache WHERE permalink_url LIKE ? OR permalink_url = ?",
-            (f"{clean_url}%", clean_url)
+            "SELECT * FROM tracks_cache WHERE permalink_url = ? OR permalink_url LIKE ? LIMIT 1",
+            (clean_url, f"{clean_url}%")
         ) as cursor:
             row = await cursor.fetchone()
             if row:
@@ -56,15 +64,18 @@ async def save_track_cache(
     duration: int
 ):
     """Сохранить трек и его telegram_file_id в кэш."""
-    clean_url = permalink_url.split("?")[0].rstrip("/")
+    if not track_id or not telegram_file_id:
+        return
+    clean_url = (permalink_url or "").split("?")[0].rstrip("/")
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute("""
             INSERT INTO tracks_cache (track_id, permalink_url, telegram_file_id, title, artist, duration)
             VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(track_id) DO UPDATE SET
+                permalink_url = excluded.permalink_url,
                 telegram_file_id = excluded.telegram_file_id,
                 title = excluded.title,
                 artist = excluded.artist,
                 duration = excluded.duration
-        """, (str(track_id), clean_url, telegram_file_id, title, artist, duration))
+        """, (str(track_id), clean_url, telegram_file_id, title or "Untitled", artist or "Unknown Artist", int(duration or 0)))
         await db.commit()
